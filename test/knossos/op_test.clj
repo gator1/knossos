@@ -2,6 +2,7 @@
   (:require [clojure.test :refer :all]
             [clojure.java.io :as io]
             [clojure.edn :as edn]
+            [clojure.string :as str]
             [knossos.op :refer :all]
             [knossos.linear :as linear]
             [knossos.linear.report :refer :all]
@@ -36,29 +37,58 @@
   ;; yep, converting a map to EDN is that simple"
   (prn-str sample-map))
 
+(comment
+  (defn read-history
+    "Reads a history file of [process type f value] tuples, or maps."
+    [f]
+    (with-open [r (PushbackReader. (io/reader f))]
+      (let [h (->> (repeatedly #(edn/read {:eof nil} r))
+                   (take-while identity)
+                   ;(println)
+                   (map (fn [op]
+                          (;( println "map loop" op)
+                            (if (map? op)
+                              op
+                              (;( println "op" op)
+                                (let [[process type f value] op]
+                                     {:process process
+                                      :type    type
+                                      :f       f
+                                      :value   value}))))))
+                   vec
+                   )]
+           (println "h" h (type h))
+           h
+           ))
+    )
+  )
+
+
 (defn read-history
   "Reads a history file of [process type f value] tuples, or maps."
   [f]
-  ( with-open [r (PushbackReader. (io/reader f))]
-       ( let [h (->> (repeatedly #(edn/read {:eof nil} r))
-                   (take-while identity)
-                   (println)
-                   (map (fn [op]
-                      (;( println "map loop" op)
-                       ( if ( map? op)
-                            op
-                            (;( println "op" op)
-                            (let [[process type f value] op]
-                            {:process process
-                            :type    type
-                            :f       f
-                            :value   value}))))))
-         vec
-       )]
-       ( println "h" h (type h))
-       h
-       ))
+  (with-open [r (PushbackReader. (io/reader f))]
+    (->> (repeatedly #(edn/read {:eof nil} r))
+         (take-while identity)
+         (map (fn [op]
+                (if (map? op)
+                  op
+                  (let [[process type f value] op]
+                       {:process process
+                        :type    type
+                        :f       f
+                        :value   value}))))
+         vec)))
+
+(defn convert-to-edn
+  [f]
+  (let [n (str/replace f ".txt" ".edn")]
+       (with-open [r (io/reader f)]
+         (with-open [w (io/writer n)]
+           (doseq [l (line-seq r)]
+             (.write w (str "[" l "]\n"))))))
   )
+
 
 (deftest cas-failure
   (testing "op test"
@@ -66,6 +96,7 @@
     (println "Let's convert a map to EDN: " (convert-sample-map-to-edn))
     (println "Now let's covert the map back: " (edn/read-string (convert-sample-map-to-edn)))
 
+    (convert-to-edn "foobar.txt")
     ( let  [ history (read-history "foobar.edn")]
       ( println history)
       )
