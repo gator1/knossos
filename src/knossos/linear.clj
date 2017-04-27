@@ -14,6 +14,7 @@
                      [memory :as memory]
                      [model :as model]
                      [util :refer :all]
+                     [weak-cache-set :as weak-cache-set]
                      [op :as op]])
   (:import [java.util ArrayList
                       Set]
@@ -61,7 +62,7 @@
   So, we construct a concurrent hashset here and use it to prune duplicate
   searches."
   []
-  (NonBlockingHashSet.))
+  (weak-cache-set/array 1e5))
 
 (defn jit-linearizations
   "Takes an initial configuration, a collection of pending invocations, and a
@@ -75,7 +76,7 @@
      (throw (InterruptedException.)))
 
    ; Record this point
-   (if-not (.add cache config)
+   (if-not (weak-cache-set/add! cache config)
      ; We can skip this execution; it'll appear in some other config's
      ; jit-linearizations
      (do ;(info :dup config)
@@ -218,64 +219,59 @@
 (defn step
   "Advance one step through the history. Takes a configset, returns a new
   configset--or a reduced failure."
-  [history state configs op]
-  (p ::step
-    (do
-      (swap! state assoc :configs configs, :op op)
-      (cond
-        ; If we're invoking an operation, just add it to each config's pending
-        ; ops.
-        (and (op/invoke? op) (not (:fails? op)))
-        (p ::invoke-op
-           (->> configs
-             (map #(t-call % op))
-             (reduce config/add! (config/set-config-set))))
 
-        ; If we're handling a completion, run each configuration through a
-        ; just-in-time linearization, accumulating a new set of configs.
-        (op/ok? op)
-        (p ::ok-op
-         (let [cache    (jit-linearizations-cache)
-               configs' (p ::search
-                           (if (< (count configs) parallel-threshold)
-                             ; Singlethreaded search
-                             (p ::single-threaded-search
-                                (let [configs' (config/set-config-set)]
-                                  (doseq [c configs]
-                                    (step-ok! cache configs' c op))
-                                  configs'))
+  [history state cache configs op]
+  (swap! state assoc :configs configs, :op op)
+  (cond
+    ; If we're invoking an operation, just add it to each config's pending
+    ; ops.
+    (and (op/invoke? op) (not (:fails? op)))
+    (->> configs
+         (map #(t-call % op))
+         (reduce config/add! (config/set-config-set)))
 
-                             ; Parallel search
-                             (p ::parallel-search
-                                (->> configs
-                                     (pmap (fn par-expand [config]
-                                             (step-ok! cache (config/set-config-set)
-                                                       config op)))
-                                     (apply concat)
-                                     ; Merge parallel results
-                                     (reduce config/add! (config/set-config-set))))))]
+    ; If we're handling a completion, run each configuration through a
+    ; just-in-time linearization, accumulating a new set of configs.
+    (op/ok? op)
+    (let [cache    (weak-cache-set/clear! cache)
+          configs' (if (< (count configs) parallel-threshold)
+                     ; Singlethreaded search
+                     (let [configs' (config/set-config-set)]
+                       (doseq [c configs]
+                         (step-ok! cache configs' c op))
+                       configs')
 
-           (if (empty? configs')
-             ; Out of options! Return a reduced debugging state.
-             (reduced {:valid?       false
-                       :configs      (map config/config->map configs)
-                       :final-paths  (final-paths history op configs)
-                       :previous-ok  (previous-ok history op)
-                       :last-op  (reduce (fn [op config]
-                                           (if (or (nil? op)
-                                                   (< (:index op)
-                                                      (:index (:last-op config))))
-                                             (:last-op config)
-                                             op))
-                                         nil
-                                         configs)
-                       :op           op})
-             ; Otherwise, return new config set.
-             configs')))
+                     ; Parallel search
+                     (->> configs
+                          (pmap (fn par-expand [config]
+                                  (step-ok! cache (config/set-config-set)
+                                            config op)))
+                          (apply concat)
+                          ; Merge parallel results
+                          (reduce config/add! (config/set-config-set))))]
 
-        ; Skip other types of ops
-        true
-        configs))))
+      (if (empty? configs')
+        ; Out of options! Return a reduced debugging state.
+        (reduced {:valid?       false
+                  :configs      (map config/config->map configs)
+                  :final-paths  (final-paths history op configs)
+                  :previous-ok  (previous-ok history op)
+                  :last-op  (reduce (fn [op config]
+                                      (if (or (nil? op)
+                                              (< (:index op)
+                                                 (:index (:last-op config))))
+                                        (:last-op config)
+                                        op))
+                                    nil
+                                    configs)
+                  :op           op})
+        ; Otherwise, return new config set.
+        configs'))
+
+    ; Skip other types of ops
+    true
+    configs))
+
 
 (def reporting-interval
   "How long (in ms) to sleep between status updates"
@@ -311,59 +307,56 @@
   its final state, plus an offending :op if an operation forced the analyzer to
   discover there are no linearizable paths."
   [model history]
-  (profile
-   {}
-   (p ::analysis
-    (let [history (p ::index-history (-> history
-                                         history/complete
-                                         history/index))
-          memo (memo model history)
-          history (:history memo)
-          configs (p ::configs
-                   (-> (:model memo)
-                       (config/config history)
-                       list
-                       config/set-config-set))
-          state (atom {:running?  true
-                       :configs   configs
-                       :op        nil})
-          thread (Thread/currentThread)
-          mem-watch (memory/on-low-mem!
-                     (fn abort []
-                       (let [s @state]
-                         (warn "Out of memory; aborting search at op"
-                               (:index (:op s)) "/" (count history)))
-                       (swap! state assoc
-                              :running? false
-                              :cause    :out-of-memory)
-                       (.interrupt thread)))
-          reporter (reporter! state)]
-      ; Perform search
-      (info "Starting search...")
-      (try (let [res (p ::step-reduce (reduce (partial step history state) configs history))]
-             (info "Search complete.")
-             (if (and (map? res) (= false (:valid? res)))
-               ; Reduced error
-               res
-               {:valid?  true
-                :configs (map config/config->map res)}))
-           (catch InterruptedException e
-             (let [{:keys [cause configs op]} @state]
-               {:valid?       :unknown
-                :cause        cause
-                :configs      (map config/config->map configs)
-                :previous-ok  (previous-ok history op)
-                :last-op      (reduce (fn [op config]
-                                        (if (or (nil? op)
-                                                (< (:index op)
-                                                   (:index (:last-op
-                                                            config))))
-                                          (:last-op config))
-                                        op)
-                                      nil
-                                      configs)
-                :op           op}))
-           (finally
-             ; Reset memory watchdog and status reporter
-             (mem-watch)
-             (reset! state {:running? false})))))))
+
+  (let [history (-> history
+                    history/complete
+                    history/index)
+        memo (memo model history)
+        history (:history memo)
+        configs (-> (:model memo)
+                    (config/config history)
+                    list
+                    config/set-config-set)
+        state (atom {:running?  true
+                     :configs   configs
+                     :op        nil})
+        thread (Thread/currentThread)
+        mem-watch (memory/on-low-mem!
+                    (fn abort []
+                      (let [s @state]
+                        (warn "Out of memory; aborting search at op"
+                              (:index (:op s)) "/" (count history)))
+                      (swap! state assoc
+                             :running? false
+                             :cause    :out-of-memory)
+                      (.interrupt thread)))
+        cache     (weak-cache-set/nbhs)
+        reporter  (reporter! state)]
+    ; Perform search
+    (try (let [res (reduce (partial step history state cache) configs history)]
+           (if (and (map? res) (= false (:valid? res)))
+             ; Reduced error
+             res
+             {:valid?  true
+              :configs (map config/config->map res)}))
+         (catch InterruptedException e
+           (let [{:keys [cause configs op]} @state]
+             {:valid?       :unknown
+              :cause        cause
+              :configs      (map config/config->map configs)
+              :previous-ok  (previous-ok history op)
+              :last-op      (reduce (fn [op config]
+                                      (if (or (nil? op)
+                                              (< (:index op)
+                                                 (:index (:last-op
+                                                           config))))
+                                        (:last-op config))
+                                      op)
+                                    nil
+                                    configs)
+              :op           op}))
+         (finally
+           ; Reset memory watchdog and status reporter
+           (mem-watch)
+           (reset! state {:running? false})))))
+
